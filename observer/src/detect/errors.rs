@@ -1,5 +1,6 @@
 use thiserror::Error;
 
+#[allow(dead_code)]
 #[derive(Error, Debug)]
 pub enum DetectionError {
     // Changed from windows::core::Error to a raw u32 code

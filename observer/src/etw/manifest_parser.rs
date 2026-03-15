@@ -1,14 +1,15 @@
+#![allow(dead_code, unsafe_op_in_unsafe_fn)]
+use crate::etw::errors::{EtwError, Result};
 use std::collections::HashMap;
 use std::fmt;
-use std::ptr::{null, null_mut};
+use std::ptr::{null_mut};
 use std::slice;
-use windows_sys::core::GUID;
 use windows_sys::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS};
 use windows_sys::Win32::System::Diagnostics::Etw::{
-    TdhEnumerateManifestProviderEvents, TdhGetManifestEventInformation, EVENT_PROPERTY_INFO,
-    PROVIDER_EVENT_INFO, TRACE_EVENT_INFO, EVENT_RECORD,
+    EVENT_PROPERTY_INFO, EVENT_RECORD, PROVIDER_EVENT_INFO, TRACE_EVENT_INFO,
+    TdhEnumerateManifestProviderEvents, TdhGetManifestEventInformation,
 };
-use crate::etw::errors::{EtwError, Result};
+use windows_sys::core::GUID;
 
 // --- Data Structures ---
 
@@ -19,7 +20,7 @@ pub struct EventProperty {
     pub in_type: String,  // e.g., "UnicodeString", "Int32"
     pub out_type: String, // e.g., "Pid", "Port", "Null"
     pub is_struct: bool,
-    pub count: u16,       // Array size (1 if scalar)
+    pub count: u16, // Array size (1 if scalar)
 }
 
 /// Represents the schema of a specific event.
@@ -132,10 +133,16 @@ impl ManifestParser {
         unsafe {
             let mut buffer_size: u32 = 0;
             // 1. Get size for Provider Info
-            let res = TdhEnumerateManifestProviderEvents(&self.provider_guid, null_mut(), &mut buffer_size);
+            let res = TdhEnumerateManifestProviderEvents(
+                &self.provider_guid,
+                null_mut(),
+                &mut buffer_size,
+            );
 
             if res != ERROR_INSUFFICIENT_BUFFER {
-                if res == ERROR_SUCCESS { return Ok(()); }
+                if res == ERROR_SUCCESS {
+                    return Ok(());
+                }
                 return Err(EtwError::WindowsError(res));
             }
 
@@ -143,14 +150,20 @@ impl ManifestParser {
             let provider_info = buffer.as_mut_ptr() as *mut PROVIDER_EVENT_INFO;
 
             // 2. Get Provider Info
-            let res = TdhEnumerateManifestProviderEvents(&self.provider_guid, provider_info, &mut buffer_size);
+            let res = TdhEnumerateManifestProviderEvents(
+                &self.provider_guid,
+                provider_info,
+                &mut buffer_size,
+            );
             if res != ERROR_SUCCESS {
                 return Err(EtwError::WindowsError(res));
             }
 
             let info_ref = &*provider_info;
-            let descriptor_ptr = (&(*provider_info).EventDescriptorsArray) as *const _ as *const windows_sys::Win32::System::Diagnostics::Etw::EVENT_DESCRIPTOR;
-            let descriptors = slice::from_raw_parts(descriptor_ptr, info_ref.NumberOfEvents as usize);
+            let descriptor_ptr = (&(*provider_info).EventDescriptorsArray) as *const _
+                as *const windows_sys::Win32::System::Diagnostics::Etw::EVENT_DESCRIPTOR;
+            let descriptors =
+                slice::from_raw_parts(descriptor_ptr, info_ref.NumberOfEvents as usize);
 
             // 3. Iterate Descriptors and Parse Schemas
             for desc in descriptors {
@@ -217,7 +230,8 @@ impl ManifestParser {
         // --- Property Parsing ---
         let mut properties = Vec::new();
         if info.PropertyCount > 0 {
-            let props_ptr = (&(*info_ptr).EventPropertyInfoArray) as *const _ as *const EVENT_PROPERTY_INFO;
+            let props_ptr =
+                (&(*info_ptr).EventPropertyInfoArray) as *const _ as *const EVENT_PROPERTY_INFO;
             let props_slice = slice::from_raw_parts(props_ptr, info.PropertyCount as usize);
 
             properties = parse_properties_recursive(props_slice, base_ptr, 0, info.PropertyCount);
@@ -243,13 +257,15 @@ unsafe fn parse_properties_recursive(
     all_props: &[EVENT_PROPERTY_INFO],
     base_ptr: *const u8,
     start_index: u32,
-    count: u32
+    count: u32,
 ) -> Vec<EventProperty> {
     let mut result = Vec::new();
 
     for i in 0..count {
         let index = (start_index + i) as usize;
-        if index >= all_props.len() { break; }
+        if index >= all_props.len() {
+            break;
+        }
 
         let prop = &all_props[index];
         let name = ptr_to_string(base_ptr, prop.NameOffset);
@@ -260,7 +276,12 @@ unsafe fn parse_properties_recursive(
             let members_start = prop.Anonymous1.structType.StructStartIndex;
             let members_count = prop.Anonymous1.structType.NumOfStructMembers;
 
-            let mut sub_props = parse_properties_recursive(all_props, base_ptr, members_start as u32, members_count as u32);
+            let sub_props = parse_properties_recursive(
+                all_props,
+                base_ptr,
+                members_start as u32,
+                members_count as u32,
+            );
 
             // Flatten struct names: "Header.Size"
             for mut sub in sub_props {
@@ -284,11 +305,17 @@ unsafe fn parse_properties_recursive(
 }
 
 unsafe fn ptr_to_string(base: *const u8, offset: u32) -> String {
-    if offset == 0 { return String::new(); }
+    if offset == 0 {
+        return String::new();
+    }
     let ptr = base.add(offset as usize) as *const u16;
     let mut len = 0;
-    while *ptr.add(len) != 0 { len += 1; }
-    String::from_utf16_lossy(slice::from_raw_parts(ptr, len)).trim().to_string()
+    while *ptr.add(len) != 0 {
+        len += 1;
+    }
+    String::from_utf16_lossy(slice::from_raw_parts(ptr, len))
+        .trim()
+        .to_string()
 }
 
 fn map_in_type(v: u16) -> String {
@@ -334,31 +361,31 @@ fn map_in_type(v: u16) -> String {
 
 fn map_out_type(v: u16) -> String {
     let s = match v {
-        0 => "Null",         // No specific output type (uses default for input type)
-        1 => "String",       // xs:string
-        2 => "DateTime",     // xs:dateTime
-        3 => "Byte",         // xs:byte
-        4 => "UnsignedByte", // xs:unsignedByte
-        5 => "Short",        // xs:short
-        6 => "UnsignedShort",// xs:unsignedShort
-        7 => "Int",          // xs:int
-        8 => "UnsignedInt",  // xs:unsignedInt
-        9 => "Long",         // xs:long
-        10 => "UnsignedLong",// xs:unsignedLong
-        11 => "Float",       // xs:float
-        12 => "Double",      // xs:double
-        13 => "Boolean",     // xs:boolean
-        14 => "Guid",        // xs:GUID
-        15 => "HexBinary",   // xs:hexBinary
-        16 => "HexInt8",     // win:HexInt8
-        17 => "HexInt16",    // win:HexInt16
-        18 => "HexInt32",    // win:HexInt32
-        19 => "HexInt64",    // win:HexInt64
-        20 => "PID",         // win:PID
-        21 => "TID",         // win:TID
-        22 => "Port",        // win:Port (Network Byte Order)
-        23 => "IPv4",        // win:IPv4
-        24 => "IPv6",        // win:IPv6
+        0 => "Null",           // No specific output type (uses default for input type)
+        1 => "String",         // xs:string
+        2 => "DateTime",       // xs:dateTime
+        3 => "Byte",           // xs:byte
+        4 => "UnsignedByte",   // xs:unsignedByte
+        5 => "Short",          // xs:short
+        6 => "UnsignedShort",  // xs:unsignedShort
+        7 => "Int",            // xs:int
+        8 => "UnsignedInt",    // xs:unsignedInt
+        9 => "Long",           // xs:long
+        10 => "UnsignedLong",  // xs:unsignedLong
+        11 => "Float",         // xs:float
+        12 => "Double",        // xs:double
+        13 => "Boolean",       // xs:boolean
+        14 => "Guid",          // xs:GUID
+        15 => "HexBinary",     // xs:hexBinary
+        16 => "HexInt8",       // win:HexInt8
+        17 => "HexInt16",      // win:HexInt16
+        18 => "HexInt32",      // win:HexInt32
+        19 => "HexInt64",      // win:HexInt64
+        20 => "PID",           // win:PID
+        21 => "TID",           // win:TID
+        22 => "Port",          // win:Port (Network Byte Order)
+        23 => "IPv4",          // win:IPv4
+        24 => "IPv6",          // win:IPv6
         25 => "SocketAddress", // win:SocketAddress
         26 => "CimDateTime",   // win:CIMDateTime
         27 => "EtwTime",       // win:ETWTIME
@@ -396,7 +423,10 @@ mod tests {
         let parser = ManifestParser::new(KERNEL_PROCESS_GUID);
 
         // Assert creation
-        assert!(parser.is_ok(), "Should successfully load Kernel-Process manifest");
+        assert!(
+            parser.is_ok(),
+            "Should successfully load Kernel-Process manifest"
+        );
         let parser = parser.unwrap();
 
         // Assert content
@@ -404,7 +434,10 @@ mod tests {
         assert!(!ids.is_empty(), "Kernel-Process should have events");
 
         // Process Start (ID 1) is a standard event in this provider
-        assert!(ids.contains(&1), "Should contain Event ID 1 (Process Start)");
+        assert!(
+            ids.contains(&1),
+            "Should contain Event ID 1 (Process Start)"
+        );
     }
 
     #[test]
@@ -418,11 +451,17 @@ mod tests {
         // Note: The exact string might vary by OS version (e.g., "ProcessStart" vs "Start"),
         // but it shouldn't be empty or generic "Event_1" if symbols are present.
         assert!(!schema.name.is_empty());
-        assert!(!schema.name.starts_with("Event_"), "Should have resolved a friendly name");
+        assert!(
+            !schema.name.starts_with("Event_"),
+            "Should have resolved a friendly name"
+        );
 
         // Verify Properties
         // Process Start usually has "ProcessID", "ImageName", etc.
-        let has_pid = schema.properties.iter().any(|p| p.name.contains("ProcessID") || p.name.contains("ProcessId"));
+        let has_pid = schema
+            .properties
+            .iter()
+            .any(|p| p.name.contains("ProcessID") || p.name.contains("ProcessId"));
         assert!(has_pid, "Event ID 1 should have a ProcessID field");
     }
 
@@ -453,7 +492,10 @@ mod tests {
         // It might return Ok with empty events, or an error, depending on Windows version/TDH behavior.
         // But if it's Ok, it must be empty.
         if let Ok(p) = parser {
-            assert!(p.list_event_ids().is_empty(), "Random provider should have no events");
+            assert!(
+                p.list_event_ids().is_empty(),
+                "Random provider should have no events"
+            );
         }
     }
 }

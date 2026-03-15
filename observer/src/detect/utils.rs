@@ -42,7 +42,7 @@ pub fn get_module_name_from_address(process_handle: HANDLE, address: u64) -> Res
 
         if result == 0 {
             let err = GetLastError();
-            log::error!(
+            log::debug!(
                 "VirtualQueryEx failed for address {:#X}. Error: {}",
                 address,
                 err
@@ -59,10 +59,11 @@ pub fn get_module_name_from_address(process_handle: HANDLE, address: u64) -> Res
             buffer.as_mut_ptr(),
             MAX_PATH,
         );
-
+        
+        
         if length == 0 {
             let err = GetLastError();
-            log::error!(
+            log::debug!(
                 "K32GetModuleBaseNameW failed for base {:?}. Error: {}",
                 mbi.AllocationBase,
                 err

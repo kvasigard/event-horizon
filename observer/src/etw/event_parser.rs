@@ -1,3 +1,5 @@
+#![allow(dead_code, unused_imports, unsafe_op_in_unsafe_fn)]
+
 use crate::etw::types::Event;
 use crate::etw::errors::{Result, EtwError};
 use std::ffi::{c_void, CStr};
@@ -243,7 +245,10 @@ impl<'a> Event<'a> {
     pub fn stack_trace(&self) -> Vec<u64> {
         EventParser::parse_stack_trace(self)
     }
-
+    
+    // Note: get_property_string function performs a heap allocation to transform the name to UTF-16. 
+    //       Use the function inside ETW loop might cause heap fragmentation, so we might want to refactor
+    //       this function to avoid heap allocation by requesting UTF-16 strings instead of &str
     pub fn get_property(&self, name: &str) -> Result<String> {
         EventParser::get_property_string(self, name)
     }

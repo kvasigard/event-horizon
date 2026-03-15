@@ -1,111 +1,131 @@
+use env_logger::{Builder, Env};
 use log;
-use std::ffi::c_void;
-use std::ptr::{null, null_mut};
-use windows_sys::Win32::System::Threading::{
-    CreateThread, GetCurrentProcessId, WaitForSingleObject,
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::thread;
+use std::time::Duration;
+use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
+use windows_sys::Win32::System::Diagnostics::Etw::{
+    EVENT_TRACE_FLAG_PROCESS, EVENT_TRACE_FLAG_SYSTEMCALL, EVENT_TRACE_FLAG_THREAD,
 };
+use windows_sys::Win32::System::Threading::GetCurrentProcessId;
 
 mod etw;
-use etw::filter;
-use etw::utils::guid_to_string;
+use etw::{KernelTrace, TraceSession};
 
 mod detect;
+use detect::{DetectionEngine, DirectSyscallDetector, IndirectSyscallDetector};
+
+/// Signals background threads to gracefully terminate when false.
+static RUNNING: AtomicBool = AtomicBool::new(true);
+
+/// Centralized engine for analyzing and broadcasting ETW events.
+static ENGINE: OnceLock<DetectionEngine> = OnceLock::new();
+
+/// Cached Process ID to avoid FFI overhead inside high-frequency ETW callbacks.
+static CURRENT_PID: OnceLock<u32> = OnceLock::new();
 
 const MICROSOFT_WINDOWS_KERNEL_AUDIT_API_CALLS: &str = "E02A841C-75A3-4FA7-AFC8-AE09CF9B7F23";
-const MICROSOFT_WINDOWS_THREAT_INTEL: &str = "F4E1897C-BB5D-5668-F1D8-040F4D8DD344";
-
 const EVENTID_OPENTHREAD: u16 = 4;
 const EVENTID_SETTHREADCONTEXT: u16 = 6;
-
 const EVENT_ENABLE_PROPERTY_STACK_TRACE: u32 = 4;
+const EVENT_TRACE_TYPE_SYSCALL_ENTER: u32 = 51;
 
-// This function is passed to a trampoline function that matches the needed C
-// structure and parses the EVENT_RECORD using the provider schema or TDH
+/// Intercepts ETW events from the OS and routes them to the detection engine.
+/// Drops events originating from the monitor itself to prevent recursive feedback loops.
 fn syscall_detection_callback(event: &etw::Event) {
-    let current_pid: u32 = unsafe { GetCurrentProcessId() };
-    // Skip current process
-    if event.pid() == current_pid {
+    let current_pid = *CURRENT_PID.get().unwrap_or(&0);
+    
+    if event.pid() == current_pid || event.pid() == u32::MAX {
         return;
     }
 
-    let _address = match detect::direct_syscalls(&event) {
-        Ok(option_address) => option_address,
-        Err(_e) => None,
-    };
+    if let Some(engine) = ENGINE.get() {
+        engine.process_etw_event(event);
+    }
 }
 
-// This matches: pub unsafe extern "system" fn(lpthreadparameter: *mut c_void) -> u32
-unsafe extern "system" fn event_loop_entry(user_trace_ptr: *mut c_void) -> u32 {
-    // Cast the void pointer back to the Rust reference
-    let user_trace = unsafe { &*(user_trace_ptr as *const etw::UserTrace) };
-    user_trace.start()
+/// Handles control signals from the OS to initiate graceful shutdown.
+unsafe extern "system" fn ctrl_handler(_ctrl_type: u32) -> i32 {
+    log::info!("Termination signal received. Shutting down...");
+    RUNNING.store(false, Ordering::SeqCst);
+    1
 }
 
-// TODO: Add proper return type for Windows
 fn main() {
-    env_logger::init();
+    // Configure the default log level without mutating process environment variables
+    Builder::from_env(Env::default().default_filter_or("info")).init();
 
-    // Define the Session (User or Kernel)
-    let mut user_trace = etw::UserTrace::new("Syscalls-Detector");
+    let pid = unsafe { GetCurrentProcessId() };
+    CURRENT_PID.set(pid).expect("Failed to cache current process ID");
 
-    // Define the Provider
-    let mut provider = etw::Provider::new(MICROSOFT_WINDOWS_KERNEL_AUDIT_API_CALLS)
-        .trace_flags(EVENT_ENABLE_PROPERTY_STACK_TRACE);
-
-    provider
-        .load_manifest()
-        .expect("Failed to load provider manifest");
-    if let Some(manifest) = &provider.manifest {
-        log::trace!("Provider manifest: {:?}", manifest);
+    unsafe {
+        SetConsoleCtrlHandler(Some(ctrl_handler), 1);
     }
 
-    let mut filter_open_thread = etw::EventFilter::new(filter::DoesMatch(EVENTID_OPENTHREAD));
-    let mut filter_set_context_threat =
-        etw::EventFilter::new(filter::DoesMatch(EVENTID_SETTHREADCONTEXT));
+    log::info!("Initializing Detection Engine...");
+    
+    let mut engine = DetectionEngine::new()
+        .add_detector(Box::new(DirectSyscallDetector::new()))
+        .add_detector(Box::new(IndirectSyscallDetector::new()));
 
-    filter_open_thread.add_callback(syscall_detection_callback);
-    filter_set_context_threat.add_callback(syscall_detection_callback);
-
-    provider.add_filter(filter_open_thread);
-    provider.add_filter(filter_set_context_threat);
-
-    log::debug!(
-        "Enabling provider {}: {}",
-        provider.name,
-        guid_to_string(&provider.guid)
-    );
-
-    user_trace.enable(provider).unwrap();
-
-    // pub unsafe extern "system" fn CreateThread(
-    //     lpthreadattributes: *const SECURITY_ATTRIBUTES,
-    //     dwstacksize: usize,
-    //     lpstartaddress: LPTHREAD_START_ROUTINE,
-    //     lpparameter: *const c_void,
-    //     dwcreationflags: THREAD_CREATION_FLAGS,
-    //     lpthreadid: *mut u32,
-    // ) -> HANDLE
-    let trace_thread_handle = unsafe {
-        CreateThread(
-            null(),
-            0,
-            Some(event_loop_entry),
-            &mut user_trace as *mut _ as *mut c_void,
-            0,
-            null_mut(),
-        )
-    };
-
-    if trace_thread_handle.is_null() {
+    if let Err(e) = engine.start() {
+        log::error!("Failed to start detection engine asynchronously: {}", e);
         return;
     }
 
-    // pub unsafe extern "system" fn WaitForSingleObject(
-    //     hhandle: HANDLE,
-    //     dwmilliseconds: u32,
-    // ) -> WAIT_EVENT
-    unsafe { WaitForSingleObject(trace_thread_handle, 20000) };
+    ENGINE.set(engine).unwrap_or_else(|_| {
+        panic!("Global engine instance was already initialized.");
+    });
 
-    // TODO: Handle Control+C termination
-    user_trace.stop();
+    let user_session = etw::UserTrace::new("Syscalls-Detector")
+        .provider_guid(MICROSOFT_WINDOWS_KERNEL_AUDIT_API_CALLS)
+        .enable_flags(EVENT_ENABLE_PROPERTY_STACK_TRACE)
+        .add_filters([
+            etw::EventFilter::new(etw::filter::DoesMatch(EVENTID_OPENTHREAD)),
+            etw::EventFilter::new(etw::filter::DoesMatch(EVENTID_SETTHREADCONTEXT)),
+        ])
+        .add_callback(syscall_detection_callback);
+
+    let kernel_session = KernelTrace::new()
+        .enable_flags(EVENT_TRACE_FLAG_SYSTEMCALL | EVENT_TRACE_FLAG_PROCESS | EVENT_TRACE_FLAG_THREAD)
+        .enable_stack_walk(EVENT_TRACE_TYPE_SYSCALL_ENTER)
+        .add_callback(syscall_detection_callback);
+
+    let user_session = Arc::new(user_session);
+    let user_session_clone = Arc::clone(&user_session);
+    
+    let kernel_session = Arc::new(kernel_session);
+    let kernel_session_clone = Arc::clone(&kernel_session);
+
+    log::info!("Starting ETW tracing sessions...");
+
+    let user_thread = thread::spawn(move || {
+        if let Err(e) = user_session_clone.start_session() {
+            log::error!("Failed to initialize UserTrace: {}", e);
+            return;
+        }
+        user_session_clone.consume();
+    });
+
+    let kernel_thread = thread::spawn(move || {
+        if let Err(e) = kernel_session_clone.start_session() {
+            log::error!("Failed to initialize NT Kernel Logger: {}", e);
+            return;
+        }
+        kernel_session_clone.consume();
+    });
+
+    // Park the main thread while the background workers collect telemetry
+    while RUNNING.load(Ordering::Relaxed) {
+        thread::sleep(Duration::from_millis(500));
+    }
+
+    log::info!("Cleaning up ETW sessions...");
+
+    user_session.stop_session();
+    kernel_session.stop_session();
+
+    let _ = user_thread.join();
+    let _ = kernel_thread.join();
 }

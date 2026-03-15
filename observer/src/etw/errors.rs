@@ -1,6 +1,7 @@
 use thiserror::Error;
 
 #[derive(Error, Debug)]
+#[allow(dead_code)]
 pub enum EtwError {
     // Changed from windows::core::Error to a raw u32 code
     #[error("Windows API Error Code: {0}")]

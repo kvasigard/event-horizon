@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use windows_sys::core::GUID;
 
 pub(crate) fn guid_to_string(guid: &windows_sys::core::GUID) -> String {
